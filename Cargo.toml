@@ -1,0 +1,33 @@
+[package]
+name = "lq"
+version = "0.1.0"
+edition = "2021"
+description = "Fast query / filter / aggregate for JSON-Lines logs, with live tailing"
+default-run = "lq"
+
+[dependencies]
+aho-corasick = "1"
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+memchr = "2.7"
+memmap2 = "0.9"
+regex = "1"
+rustc-hash = "2"
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["float_roundtrip"] }
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[[bin]]
+name = "lq"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen-logs"
+path = "src/bin/gen_logs.rs"

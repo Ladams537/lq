@@ -1,0 +1,208 @@
+# lq — fast queries over JSON-Lines logs
+
+`lq` filters, projects and aggregates structured (JSON-Lines) logs from the command line, and
+can follow growing files live. It is built for one job (asking questions of log records), not
+for general JSON transformation. On that job it runs **91–204x faster than `jq`** (21–58x on a
+single core) and **49–111x faster than `jaq`** (12–32x single-core), the Rust jq clone. Every
+benchmark answer is checked against both tools' output.
+
+```sh
+cargo build --release                      # binaries: target/release/lq, target/release/gen-logs
+
+lq 'level == "error"' app.log                                   # matching records, as-is
+lq 'status >= 500 | select ts, service, msg' app.log            # projection (JSON / -o tsv|csv|table)
+lq 'stats count(), avg(latency_ms), p99(latency_ms) by service' app.log
+lq 'http.method == "POST" | top 5 http.path' app.log
+lq 'count by service | where count > 1000 | sort count desc' app.log
+lq -f 'level == "error" | count by service' app.log             # live table, re-rendered every second
+kubectl logs -f deploy/api | lq 'latency_ms > 1000 | select ts, msg'
+```
+
+## Query language
+
+A query is a pipeline of stages joined by `|`. A stage that doesn't start with a keyword is a filter.
+
+| stage | meaning |
+|---|---|
+| `EXPR` / `where EXPR` | keep records where EXPR is true |
+| `select a, b.c as x` | output only these fields (JSON objects; `-o tsv\|csv\|table`) |
+| `count [by a, b]` | count records, optionally per group |
+| `stats AGG, ... [by a, b]` | `count()` `count(x)` `sum` `avg` `min` `max` `median` `p50`…`p99.9` `distinct` (each takes `as name`) |
+| `top N a[, b]` | shorthand for `count by a \| sort count desc \| head N` |
+| `sort a [desc], ...` | sort records or aggregate rows |
+| `head N` / `limit N` | first N; for records, it stops reading input once satisfied |
+
+After an aggregation, `where`/`sort`/`head` refer to result columns, like SQL's `HAVING`. You
+can name a column by its `as` alias or by the function that computed it: `sort avg(latency_ms)
+desc`, and `median(x)` and `p50(x)` both work. Using an aggregate column before the aggregation
+is an error.
+
+Each stage only sees what the previous one produced. After `select`, later stages can only use
+the selected names, so `select service | where level == "warn"` is an error rather than a
+silent read of a field that was projected away.
+
+**Expressions:** `== != < <= > >=`, `=~ !~` (regex), `contains`, `startswith`, `endswith`,
+`in [..]`, `exists(x)`, `and or not` (also `&& || !`), and parentheses. A bare field is a
+truthiness test.
+**Fields:** `level`, `.level`, `http.status`, `tags[0]`, `["@timestamp"]`, `a["key with spaces"]`.
+**Semantics:** a missing field compares as `null`. Ordering operators only compare
+number/number or string/string, and anything else is false (jq would order across types).
+`lq --help` has the full reference.
+
+**Options:** `-f/--follow` and `--from-start` (live tailing), `-o auto|json|table|tsv|csv`,
+`-j N` threads, `--stats` (throughput to stderr), `--explain` (print the compiled plan),
+`--no-prefilter`. `tsv`, `csv` and `table` need columns, so they require a `select` or an
+aggregation, and are rejected otherwise.
+
+**Exit status** works like grep: 0 if anything matched, 1 if nothing did (so `if lq ...; then`
+works), and 2 on errors.
+
+## Live tailing
+
+`lq -f QUERY FILE...` starts at the end of each file. It processes appended lines as they land
+(polled every 50 ms), and a half-written line waits until its newline arrives. Like `tail -F`,
+it survives **truncation** and **rotation** (rename and recreate). An unterminated last line of
+a rotated file is still processed. Record queries stream
+matching lines. Aggregations re-render the result table every `--interval` seconds (an
+in-place redraw on a terminal, appended blocks when piped). With `--from-start`, the existing
+content goes through the parallel engine first, so a live dashboard over a large file starts
+in milliseconds. Malformed lines are reported on stderr as they turn up. Piped stdin
+(`tail -f x | lq ...`) is processed as soon as `read()` returns data, so it is live without `-f`.
+`-f` on stdin is therefore rejected rather than ignored. So is `-o table`, which has to see the
+whole output before it can align columns (use `-o tsv`).
+
+Known limits of follow mode:
+- `p99` and `distinct` keep every value, so their memory grows with the stream. A bounded
+  sketch (t-digest or DDSketch for percentiles, HyperLogLog for distinct) would fix this, at
+  the cost of exactness.
+- Each re-render selects percentiles in place, which costs O(n) per render but copies nothing.
+- Files are polled every 50 ms rather than watched with kqueue/inotify.
+- A truncation is noticed when the file becomes shorter than the read position. If it is
+  truncated and rewritten past that position between two polls, the change is missed. `tail -F`
+  has the same blind spot.
+
+## Performance
+
+Full results, regenerated by `bench/bench.py`, are in [bench/RESULTS.md](bench/RESULTS.md):
+
+1,000,000 lines (281 MB), Apple M2 (4 performance + 4 efficiency cores), jq 1.7.1, jaq 3.1.1:
+
+| case | what | lq | lq -j1 | lq (stdin) | jq | vs jq | vs jq, 1 thread | jaq | vs jaq | vs jaq, 1 thread |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| filter-eq | records where level == "error" (5%) | 21 ms | 75 ms | 29 ms | 4.31 s | **201x** ✓ | 57.5x | 2.38 s | **111x** ✓ | 31.7x |
+| filter-num | records where status >= 500 (~5.5%) | 49 ms | 208 ms | 56 ms | 4.42 s | **91x** ✓ | 21.3x | 2.41 s | **49x** ✓ | 11.6x |
+| needle | find one request_id (1 match) | 21 ms | 73 ms | 29 ms | 3.90 s | **183x** ✓ | 53.5x | 2.22 s | **105x** ✓ | 30.5x |
+| count-and | count of error AND status>=500 | 25 ms | 93 ms | 30 ms | 3.89 s | **157x** ✓ | 41.8x | 2.31 s | **94x** ✓ | 24.8x |
+| project | select 3 fields from every record | 48 ms | 167 ms | 52 ms | 6.46 s | **135x** ✓ | 38.8x | 4.39 s | **92x** ✓ | 26.4x |
+| group-count | count by service | 32 ms | 116 ms | 38 ms | 6.11 s | **188x** ✓ | 52.9x | 2.17 s | **67x** ✓ | 18.7x |
+| group-2key | count by http.method, status (nested field) | 57 ms | 246 ms | 62 ms | 6.93 s | **121x** ✓ | 28.2x | 3.00 s | **52x** ✓ | 12.2x |
+| group-stats | count, avg, max of latency by service | 61 ms | 247 ms | 69 ms | 12.48 s | **204x** ✓ | 50.6x | 5.20 s | **85x** ✓ | 21.1x |
+| p99 | p99 latency by service (exact, nearest-rank) | 68 ms | 243 ms | 69 ms | 7.08 s | **104x** ✓ | 29.1x | 3.98 s | **58x** ✓ | 16.4x |
+| regex | count msg =~ "timeout|refused" | 58 ms | 174 ms | 72 ms | 5.92 s | **102x** ✓ | 34.1x | 5.17 s | **89x** ✓ | 29.8x |
+
+lq figures are median wall time on 8 threads, `-j1` on one thread. "stdin" means `lq < file`, so
+there's no mmap and data arrives through a pipe-sized read loop. jq/jaq figures are the
+idiomatic streaming program for the same question (the exact programs are in `bench/bench.py`).
+The harness checks each lq answer against both jq's and jaq's before it times anything.
+
+### Why it's fast
+
+Timing jq on these cases shows where its time goes. Cost is roughly flat across queries
+(about 4 s for a filter, 6 s once it has to build output objects), so jq is paying per input
+byte, not per answer. lq avoids each of those costs in turn:
+
+1. **No DOM, lazy fields.** jq parses every record into a tree of refcounted values, including
+   fields the query never touches. lq compiles the fields a query needs into a small trie, then
+   makes one pass over each line. It records the byte span of each wanted value, skips
+   everything else structurally (finding string ends with SIMD `memchr2`), and **stops at the
+   last needed field**. Values are decoded (unescaped, number-parsed) only when a predicate
+   reads them.
+2. **No re-serialization.** A matching record is written out as its original bytes, and
+   `select` splices the original value bytes into the output. jq re-encodes every value it
+   emits, which is why `project` is its slowest filter.
+3. **Substring prefilter.** For filters that require a literal (`level == "error"`, `msg
+   contains "timeout"`), lq runs a SIMD `memmem` over the whole chunk and jumps between
+   hits, so lines that can't match are never looked at. Alternatives such as
+   `level in ["error", "warn"]` or an `or` of literals use a multi-literal Aho-Corasick search
+   instead. Within an `and`, the most selective requirement wins: fewest alternatives first,
+   then the longest shortest-literal. Ranking by byte rarity, as ripgrep does, would choose better. This is sound, not a heuristic. JSON
+   can only spell a string differently through escapes, so the prefilter applies only to
+   literals free of `"`, `\`, `/` and control characters, and any chunk containing a `\u`
+   escape falls back to checking per line (tested). It matters most when the field sits late in
+   the record. Single-threaded, `error.type == "TimeoutError"` runs at 3.9 GB/s with the
+   prefilter and 1.1 GB/s without (`--no-prefilter`), and `msg contains "refused"` at 3.9 vs
+   1.7 GB/s. For `level == "error"` it hardly helps, because `level` is the second key and the
+   scanner exits after two fields anyway.
+4. **Parallel, in order.** The file is mmapped and cut into chunks of a few MB at line
+   boundaries. Workers pull chunks, filter them, and keep per-thread aggregate state that is
+   merged at the end. The main thread writes record output in input order through a reorder
+   buffer, so output is identical to `-j1` (tested). The producer can only issue a chunk while
+   it is fewer than 2 x threads chunks ahead of the last one written. A stalled consumer (`less`,
+   a slow pipe) therefore stalls lq: RSS stays around 75 MB on the 281 MB benchmark log instead
+   of growing with the output (tested). `head N` counts records, not newlines, because a CSV
+   field can contain a newline, and it exits as soon as N records are written.
+5. **No interpreter.** Field references resolve to slot indices at compile time, so evaluation
+   is a walk over a small expression tree with no name lookups or backtracking.
+
+Points 1, 2, 3 and 5 are algorithmic and account for the **21–58x single-threaded** speedup over jq.
+Parallelism multiplies that by 3–4.5x on this 4P+4E-core M2. That is not 8x, because the
+efficiency cores are slower and the fastest cases are already near the page-cache copy and
+page-fault limit (14 GB/s for `level == "error" | count`).
+
+### Where lq is *not* 3x faster
+
+- **Tiny inputs.** On a 100-line file, lq takes 2.7 ms and jq 3.5 ms (1.3x). Both times are
+  mostly process creation, and no query engine can win back time that isn't spent querying.
+- **Output-bound pipelines.** When most records match and the consumer is slow (a terminal,
+  `less`, a network pipe), both tools run at the consumer's speed. lq still uses far less CPU.
+- **Things jq does that lq doesn't do at all.** These include reshaping documents, arithmetic,
+  string interpolation, user-defined functions, and handling non-JSONL input (a single large
+  document, or pretty-printed multi-line records). lq is deliberately narrower, and none of its
+  speedups would survive turning it into a general JSON transformer, because that requires
+  materializing values. For those jobs, keep using jq. The sensible combination is to filter
+  with lq and transform the much smaller result with jq.
+- **jaq** is the stronger baseline. It is roughly 2x faster than jq in most cases, and equal
+  on regex, where both spend their time in the regex engine. lq's worst single-threaded margin
+  over it is about 12x (`group-2key` and `filter-num`, where the wanted fields come late in each line
+  and no literal is available for the prefilter).
+
+## Semantics and caveats (deliberate trade-offs)
+
+- **Validation is lazy.** Every line must at least be framed as `{...}`, so even a field-free
+  `count` won't count garbage. Beyond that, a line is only checked as far as the scanner had to
+  walk: damage after the last needed field goes unreported, and lines ruled out by the
+  prefilter are never parsed. Broken lines that are noticed are counted and reported on stderr
+  (`lq: skipped N malformed line(s)`).
+- **Duplicate keys:** the first occurrence of a key wins, as a whole: in
+  `{"o":{"a":1},"o":{"b":2}}`, `o.b` is null. jq uses the last occurrence. First-wins is what
+  lets the scanner stop early.
+- **Numbers** are compared as f64. Group keys use the original text (`200` and `200.0` are
+  different groups), while string keys are compared after unescaping (`"\u0065rror"` groups
+  with `"error"`).
+- **Percentiles** are exact, using nearest-rank over every value (they match jq's `sort | .[ceil(n·q)-1]`).
+  The cost is 8 bytes per value per group. `distinct` keeps a set of every distinct value.
+- **Aggregate rows** come out sorted by group key unless you `sort`. Record `sort` buffers all
+  matching records, and is rejected with `--follow`.
+- **mmap:** if another process truncates a file *while lq is reading it* (not following it),
+  the OS may kill lq with SIGBUS. ripgrep and other mmap-based tools make the same trade-off.
+  `--follow` reads through `read()` and isn't affected.
+
+## Layout
+
+| file | role |
+|---|---|
+| `src/json.rs` | lazy field-extraction trie and scanner, unescaping, number parsing (differential-tested against serde_json, mutation-fuzzed for panics) |
+| `src/query.rs` | lexer and parser for the pipeline language |
+| `src/plan.rs` | compiles stages into a plan: field slots, filter, prefilter needle, aggregation, row ops |
+| `src/eval.rs` | expression evaluation over JSON slots or result rows; needle soundness rules |
+| `src/agg.rs` | per-thread group-by state, accumulators, merge |
+| `src/exec.rs` | chunked parallel engine with ordered output, stdin streaming, `--follow` |
+| `src/output.rs` | JSON / TSV / CSV / aligned-table rendering |
+| `src/bin/gen_logs.rs` | deterministic synthetic log generator (`gen-logs N [seed]`, `gen-logs --rate N`) |
+| `tests/cli.rs` | end-to-end tests: ordering, prefilter soundness, head, aggregates, formats, follow/rotation, backpressure, exit codes |
+
+```sh
+cargo test --release
+python3 bench/bench.py [--lines 1000000] [--jaq /path/to/jaq]   # writes bench/RESULTS.md
+./target/release/gen-logs --rate 20 >> /tmp/live.log &   # then: lq -f 'level != "debug" | top 5 msg' /tmp/live.log
+```
